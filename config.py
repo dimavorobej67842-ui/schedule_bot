@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,6 +14,11 @@ class Settings(BaseSettings):
 
     # Расписание
     group: str = "2025-ТНГ-96Д"
+
+    @field_validator("group")
+    @classmethod
+    def _empty_group_is_default(cls, v: str) -> str:
+        return v.strip() or "2025-ТНГ-96Д"
 
     # VK (юзер-токен: читает беседу, откуда кидают файл)
     vk_token: str = ""
