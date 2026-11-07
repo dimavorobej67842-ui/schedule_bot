@@ -16,7 +16,8 @@ from bot.handlers import router
 from config import settings
 from main import make_bot, set_commands_menu
 from services.state import State
-from watcher import _check_once
+from services.vk_source import VkError, is_auth_error
+from watcher import _TOKEN_ALERT, _check_once
 
 log = logging.getLogger(__name__)
 
@@ -53,9 +54,20 @@ async def run() -> None:
     if updates:
         state.tg_offset = updates[-1].update_id + 1
 
-    text = await asyncio.to_thread(_check_once, state)
-    if text:
-        await bot.send_message(settings.chat_id, text, parse_mode="HTML")
+    try:
+        messages = await asyncio.to_thread(_check_once, state)
+    except VkError as exc:
+        log.error("VK: %s", exc)
+        if is_auth_error(exc) and not state.vk_alerted:
+            await bot.send_message(settings.chat_id, _TOKEN_ALERT)
+            state.vk_alerted = True
+        state.save(settings.state_file)
+        await bot.session.close()
+        return
+    state.vk_alerted = False
+
+    for chat_id, text in messages:
+        await bot.send_message(chat_id, text, parse_mode="HTML")
     state.save(settings.state_file)
     await bot.session.close()
     log.info("Прогон готов: апдейтов %s, файл VK %s", len(updates), state.last_doc_title or "нет нового")

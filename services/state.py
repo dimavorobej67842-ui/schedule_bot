@@ -13,6 +13,7 @@ class State:
     last_doc_title: str = ""
     tg_offset: int = 0  # последний обработанный update_id Telegram
     users: dict[str, str] = field(default_factory=dict)  # telegram id -> группа
+    vk_alerted: bool = False  # предупреждение о мёртвом VK-токене уже отправлено
 
     @classmethod
     def load(cls, path: Path) -> "State":
