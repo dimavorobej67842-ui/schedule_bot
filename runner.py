@@ -75,7 +75,13 @@ async def run() -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except Exception as exc:
+        log.exception("Прогон упал")
+        first = str(exc).splitlines()[0][:150] if str(exc) else ""
+        print(f"::error::{type(exc).__name__}: {first}")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

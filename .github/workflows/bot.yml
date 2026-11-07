@@ -34,6 +34,32 @@ jobs:
             openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 -in state.json.enc -out state.json -pass pass:"$STATE_KEY"
           fi
 
+      - name: Диагностика секретов
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          GROUP: ${{ secrets.GROUP }}
+          VK_TOKEN: ${{ secrets.VK_TOKEN }}
+          VK_CHAT_PEER_ID: ${{ secrets.VK_CHAT_PEER_ID }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          for name in BOT_TOKEN CHAT_ID GROUP VK_TOKEN VK_CHAT_PEER_ID STATE_KEY; do
+            val="${!name}"
+            if [ -z "$val" ]; then
+              echo "::notice::secret $name: ПУСТОЙ ИЛИ НЕ ДОБАВЛЕН"
+            else
+              echo "::notice::secret $name: добавлен (символов: ${#val})"
+            fi
+          done
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "::error::BOT_TOKEN пустой — секрет не добавлен или имя записано не точно (нужно ровно BOT_TOKEN)"
+            exit 1
+          fi
+          if [ -z "$CHAT_ID" ]; then
+            echo "::error::CHAT_ID пустой — секрет не добавлен или имя записано не точно (нужно ровно CHAT_ID)"
+            exit 1
+          fi
+
       - name: Прогон бота
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
