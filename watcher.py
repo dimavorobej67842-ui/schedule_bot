@@ -71,16 +71,21 @@ def _check_once(state: State) -> list[tuple[str, str]]:
 
 
 async def watch_vk(bot: Bot) -> None:
-    state = State.load(settings.state_file)
     token_alerted = False
     while True:
         try:
+            # state перечитывается каждый цикл: handlers пишут новых пользователей в тот же файл
+            state = State.load(settings.state_file)
             messages = await asyncio.to_thread(_check_once, state)
             token_alerted = False
             if messages:
                 for chat_id, text in messages:
                     await bot.send_message(chat_id, text, parse_mode="HTML")
-                state.save(settings.state_file)
+                # сохранить только поля файла, чтобы не затереть регистрации во время рассылки
+                fresh = State.load(settings.state_file)
+                fresh.last_doc_date = state.last_doc_date
+                fresh.last_doc_title = state.last_doc_title
+                fresh.save(settings.state_file)
         except VkError as exc:
             if is_auth_error(exc):
                 if not token_alerted:
