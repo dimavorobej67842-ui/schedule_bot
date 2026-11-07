@@ -1,0 +1,60 @@
+name: schedule-bot
+
+on:
+  schedule:
+    - cron: "*/2 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: schedule-bot
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Зависимости
+        run: pip install -r requirements.txt
+
+      - name: Расшифровать состояние
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          if [ -f state.json.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -md sha256 -in state.json.enc -out state.json -pass pass:"$STATE_KEY"
+          fi
+
+      - name: Прогон бота
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          GROUP: ${{ secrets.GROUP }}
+          VK_TOKEN: ${{ secrets.VK_TOKEN }}
+          VK_CHAT_PEER_ID: ${{ secrets.VK_CHAT_PEER_ID }}
+          ELJUR_URL: ${{ secrets.ELJUR_URL }}
+          ELJUR_LOGIN: ${{ secrets.ELJUR_LOGIN }}
+          ELJUR_PASSWORD: ${{ secrets.ELJUR_PASSWORD }}
+        run: python runner.py
+
+      - name: Зашифровать и сохранить состояние
+        env:
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+        run: |
+          openssl enc -aes-256-cbc -pbkdf2 -md sha256 -in state.json -out state.json.enc -pass pass:"$STATE_KEY"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json.enc
+          if ! git diff --cached --quiet; then
+            git commit -m "state: обновление"
+            git push
+          fi
