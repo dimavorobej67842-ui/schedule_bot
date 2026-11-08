@@ -142,4 +142,4 @@ async def watch_vk_favorites(bot: Bot) -> None:
             log.exception("Telegram: не удалось отправить сообщение (избранное)")
         except Exception:
             log.exception("watcher-избранное: ошибка цикла проверки")
-        await asyncio.sleep(settings.vk_check_interval)
+        await asyncio.sleep(60)  # Избранное проверяем чаще: это канал для быстрых проверок
