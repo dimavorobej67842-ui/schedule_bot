@@ -7,13 +7,13 @@ import logging
 from datetime import date, timedelta
 from html import escape
 
-from aiogram import F, Router
+from aiogram import BaseMiddleware, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import settings
-from services import pipeline
+from services import pipeline, visits
 from services.state import State
 from services.vk_source import VkError, is_auth_error
 
@@ -29,6 +29,51 @@ _HELP = (
     "/group — сменить группу\n\n"
     "Как в беседе VK появляется новый файл — присылаю расписание сам."
 )
+
+
+class VisitMiddleware(BaseMiddleware):
+    """Лог каждого действия пользователя в visits.jsonl."""
+
+    async def __call__(self, handler, event: Message | CallbackQuery, data):
+        try:
+            visits.record(event, settings.visits_file)
+        except Exception:
+            log.exception("Не удалось записать визит в %s", settings.visits_file)
+        return await handler(event, data)
+
+
+router.message.outer_middleware(VisitMiddleware())
+router.callback_query.outer_middleware(VisitMiddleware())
+
+
+def _fmt_visits(rows: list[dict], total_actions: int) -> str:
+    if not rows:
+        return "Пока никто не заходил."
+
+    def _plural(n: int) -> str:
+        if n % 10 == 1 and n % 100 != 11:
+            return f"{n} заход"
+        if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+            return f"{n} захода"
+        return f"{n} заходов"
+
+    def _times(u: dict) -> str:
+        if not u["last_ts"]:
+            return "заходов не залогировано"
+        return f"первый {u['first_ts']} · последний {u['last_ts']} · {_plural(u['count'])}"
+
+    lines = [f"Заходили в бота: {len(rows)} чел., всего {total_actions} действий.", ""]
+    shown = rows[:30]
+    for u in shown:
+        who = escape(u["name"] or str(u["user_id"]))
+        if u["username"]:
+            who += f" (@{escape(u['username'])})"
+        group = escape(u["group"]) if u["group"] else "—"
+        lines.append(f"{who} — {group}")
+        lines.append(f"    {_times(u)}")
+    if len(rows) > len(shown):
+        lines.append(f"\n…и ещё {len(rows) - len(shown)}")
+    return "\n".join(lines)
 
 
 def _groups_keyboard(groups: list[str]) -> InlineKeyboardMarkup:
@@ -109,6 +154,16 @@ async def cmd_today(message: Message) -> None:
 @router.message(Command("tomorrow"))
 async def cmd_tomorrow(message: Message) -> None:
     await _send_schedule(message, message.from_user.id, date.today() + timedelta(days=1))
+
+
+@router.message(Command("visits"))
+async def cmd_visits(message: Message) -> None:
+    """Кто заходил в бота — только для владельца, остальным молча игнорируем."""
+    if message.from_user.id != settings.chat_id:
+        return
+    state = State.load(settings.state_file)
+    rows, total_actions = visits.summary(state, settings.visits_file)
+    await message.answer(_fmt_visits(rows, total_actions))
 
 
 @router.callback_query(F.data.startswith(_CB_PREFIX))

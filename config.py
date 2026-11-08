@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # Файлы
     bells_file: Path = Path("bells.json")
     state_file: Path = Path("state.json")
+    visits_file: Path = Path("visits.jsonl")
     download_dir: Path = Path("downloads")
 
 

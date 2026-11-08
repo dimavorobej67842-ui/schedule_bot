@@ -7,7 +7,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.types import BotCommand, MenuButtonDefault
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, MenuButtonDefault
 
 from bot.handlers import router
 from config import settings
@@ -20,13 +20,22 @@ def make_bot() -> Bot:
 
 
 async def set_commands_menu(bot: Bot) -> None:
-    """Меню команд рядом с полем ввода (кнопка ☰)."""
-    await bot.set_my_commands([
+    """Меню команд рядом с полем ввода (кнопка ☰).
+
+    /visits показывается только в чате владельца (scope=Chat) —
+    остальные его не видят, а хендлер молча игнорирует чужие запросы.
+    """
+    common = [
         BotCommand(command="start", description="Старт и выбор группы"),
         BotCommand(command="today", description="Расписание на сегодня"),
         BotCommand(command="tomorrow", description="Расписание на завтра"),
         BotCommand(command="group", description="Выбрать или сменить группу"),
-    ])
+    ]
+    await bot.set_my_commands(common, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(
+        common + [BotCommand(command="visits", description="Кто заходил (только тебе)")],
+        scope=BotCommandScopeChat(chat_id=settings.chat_id),
+    )
     await bot.set_chat_menu_button(menu_button=MenuButtonDefault())
 
 

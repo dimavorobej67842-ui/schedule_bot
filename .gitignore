@@ -1,5 +1,6 @@
 .env
 state.json
+visits.jsonl
 downloads/
 __pycache__/
 *.pyc
