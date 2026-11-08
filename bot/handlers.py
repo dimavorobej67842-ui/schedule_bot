@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from html import escape
 
 from aiogram import BaseMiddleware, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -65,9 +66,12 @@ def _fmt_visits(rows: list[dict], total_actions: int) -> str:
     lines = [f"Заходили в бота: {len(rows)} чел., всего {total_actions} действий.", ""]
     shown = rows[:30]
     for u in shown:
-        who = escape(u["name"] or str(u["user_id"]))
+        parts = []
+        if u["name"]:
+            parts.append(escape(u["name"]))
         if u["username"]:
-            who += f" (@{escape(u['username'])})"
+            parts.append(f"(@{escape(u['username'])})")
+        who = " ".join(parts) or str(u["user_id"])
         group = escape(u["group"]) if u["group"] else "—"
         lines.append(f"{who} — {group}")
         lines.append(f"    {_times(u)}")
@@ -156,6 +160,22 @@ async def cmd_tomorrow(message: Message) -> None:
     await _send_schedule(message, message.from_user.id, date.today() + timedelta(days=1))
 
 
+async def _fill_names(bot, rows: list[dict]) -> None:
+    """Подтянуть имя/юзернейм из Telegram для тех, кого ещё нет в логе визитов."""
+    for u in rows:
+        if u["name"] and u["username"]:
+            continue
+        try:
+            chat = await bot.get_chat(u["user_id"])
+        except TelegramAPIError:
+            log.warning("Не удалось получить профиль %s", u["user_id"])
+            continue
+        if not u["name"]:
+            u["name"] = " ".join(filter(None, [chat.first_name or "", chat.last_name or ""])).strip()
+        if not u["username"]:
+            u["username"] = chat.username or ""
+
+
 @router.message(Command("visits"))
 async def cmd_visits(message: Message) -> None:
     """Кто заходил в бота — только для владельца, остальным молча игнорируем."""
@@ -163,6 +183,7 @@ async def cmd_visits(message: Message) -> None:
         return
     state = State.load(settings.state_file)
     rows, total_actions = visits.summary(state, settings.visits_file)
+    await _fill_names(message.bot, rows)
     await message.answer(_fmt_visits(rows, total_actions))
 
 
