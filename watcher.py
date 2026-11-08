@@ -13,7 +13,7 @@ from config import settings
 from services import pipeline
 from services.formatter import format_schedule
 from services.state import State
-from services.vk_source import VkError, is_auth_error
+from services.vk_source import VkDocument, VkError, VkSource, is_auth_error
 
 log = logging.getLogger(__name__)
 
@@ -96,4 +96,50 @@ async def watch_vk(bot: Bot) -> None:
             log.exception("Telegram: не удалось отправить сообщение")
         except Exception:
             log.exception("watcher: ошибка цикла проверки")
+        await asyncio.sleep(settings.vk_check_interval)
+
+
+async def watch_vk_favorites(bot: Bot) -> None:
+    """«Избранное» VK: новый .docx -> расписание ТОЛЬКО владельцу (канал для проверок)."""
+    token_alerted = False
+    while True:
+        try:
+            # state перечитывается каждый цикл: не затирать регистрации и поля основного watcher
+            state = State.load(settings.state_file)
+            found: list[tuple[VkSource, VkDocument]] = []
+            for peer_id in settings.fav_peer_ids:
+                vk = VkSource(settings.vk_token, peer_id, settings.download_dir)
+                found += [(vk, d) for d in await asyncio.to_thread(vk.find_new_docx, state.fav_doc_date)]
+            found.sort(key=lambda t: t[1].date)
+            token_alerted = False
+            for vk, doc in found:
+                log.info("VK-избранное: новый файл %r от %d", doc.title, doc.date)
+                path = await asyncio.to_thread(vk.save, doc)
+                try:
+                    schedule = await asyncio.to_thread(pipeline.load_schedule_from_file,
+                                                       path, settings.group)
+                    await asyncio.to_thread(pipeline.enrich_with_homework, schedule)
+                    text = format_schedule(schedule, pipeline.bells,
+                                           heading="Тест из Избранного — расписание на")
+                except ValueError as exc:
+                    text = f"⚠️ {escape(doc.title)}: {escape(str(exc))}"
+                except Exception:
+                    log.exception("Избранное: не удалось разобрать %r", doc.title)
+                    text = f"⚠️ Файл {escape(doc.title)} разобрать не удалось — подробности в логах."
+                await bot.send_message(settings.chat_id, text, parse_mode="HTML")
+                # сохранить только поля избранного, чтобы не затереть остальное
+                fresh = State.load(settings.state_file)
+                fresh.fav_doc_date = doc.date
+                fresh.fav_doc_title = doc.title
+                fresh.save(settings.state_file)
+        except VkError as exc:
+            if is_auth_error(exc):
+                if not token_alerted:
+                    await bot.send_message(settings.chat_id, _TOKEN_ALERT)
+                    token_alerted = True
+            log.error("VK-избранное: %s", exc)
+        except TelegramAPIError:
+            log.exception("Telegram: не удалось отправить сообщение (избранное)")
+        except Exception:
+            log.exception("watcher-избранное: ошибка цикла проверки")
         await asyncio.sleep(settings.vk_check_interval)

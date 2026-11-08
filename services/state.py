@@ -11,6 +11,8 @@ from pathlib import Path
 class State:
     last_doc_date: int = 0
     last_doc_title: str = ""
+    fav_doc_date: int = 0  # последний обработанный файл из «Избранного» VK
+    fav_doc_title: str = ""
     tg_offset: int = 0  # последний обработанный update_id Telegram
     users: dict[str, str] = field(default_factory=dict)  # telegram id -> группа
     vk_alerted: bool = False  # предупреждение о мёртвом VK-токене уже отправлено

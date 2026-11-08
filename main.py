@@ -11,7 +11,7 @@ from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefaul
 
 from bot.handlers import router
 from config import settings
-from watcher import watch_vk
+from watcher import watch_vk, watch_vk_favorites
 
 
 def make_bot() -> Bot:
@@ -49,6 +49,7 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
     asyncio.create_task(watch_vk(bot))
+    asyncio.create_task(watch_vk_favorites(bot))
     log = logging.getLogger(__name__)
     log.info("Бот запущен, группа %s, беседа VK %s, прокси %s",
              settings.group, settings.vk_chat_peer_id, settings.tg_proxy or "нет")

@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     vk_token: str = ""
     vk_chat_peer_id: int = 0  # peer_id беседы, например 2000000001
     vk_check_interval: int = 300  # секунд между проверками беседы
+    # «Избранное» VK (спец-диалог 2000000001) и диалог с собой: файлы оттуда идут ТОЛЬКО владельцу
+    vk_fav_peer_ids: str = "2000000001,526672312"
+
+    @property
+    def fav_peer_ids(self) -> list[int]:
+        return [int(x) for x in self.vk_fav_peer_ids.replace(";", ",").split(",") if x.strip()]
 
     # ЭлЖур
     eljur_url: str = ""  # например https://school.eljur.ru

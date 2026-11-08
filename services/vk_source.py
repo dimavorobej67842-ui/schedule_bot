@@ -78,6 +78,31 @@ class VkSource:
                 )
         return None
 
+    def find_new_docx(self, min_date: int = 0) -> list[VkDocument]:
+        """Все .docx строго новее min_date (unix seconds), от старых к новым."""
+        response = self._call("messages.getHistory", peer_id=self.peer_id, count=50)
+        found: list[VkDocument] = []
+        for msg in response.get("items", []):
+            msg_date = msg.get("date", 0)
+            if msg_date <= min_date:
+                break
+            for att in msg.get("attachments", []):
+                if att.get("type") != "doc":
+                    continue
+                doc = att["doc"]
+                title = doc.get("title") or ""
+                if not title.lower().endswith(ALLOWED_EXT):
+                    continue
+                found.append(VkDocument(
+                    title=title,
+                    content=self._download(doc["url"]),
+                    date=msg_date,
+                    message_id=msg.get("id", 0),
+                ))
+                break
+        found.sort(key=lambda d: d.date)
+        return found
+
     def _download(self, url: str) -> bytes:
         resp = requests.get(url, timeout=60)
         resp.raise_for_status()
