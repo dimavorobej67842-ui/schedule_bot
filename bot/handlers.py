@@ -26,7 +26,7 @@ from config import settings
 from services import pdf_bridge, pipeline, visits
 from services.formatter import format_schedule
 from services.models import DaySchedule
-from services.parser import collect_groups, extract_header_stamp, normalize_group
+from services.parser import collect_groups, extract_header_stamp
 from services.state import State, left_reason, note_left, note_return
 from services.vk_source import VkError, is_auth_error
 
@@ -536,7 +536,6 @@ def _build_full_messages(path: Path, title: str, state: State, *,
         messages = watcher._build_messages(path, title, state)
 
     meta = _push_meta(path)
-    groups_in_file = {normalize_group(g) for g in meta["groups"]}
     day, week = meta["date"], meta["week"]
 
     owner_id = str(settings.chat_id)
@@ -548,9 +547,16 @@ def _build_full_messages(path: Path, title: str, state: State, *,
     sent_uids = {uid for uid, _ in messages}
     extra: list[tuple[str, str]] = []
     for uid, group in recipients:
-        if uid in sent_uids or normalize_group(group or "") in groups_in_file:
+        if uid in sent_uids:
             continue
-        extra.append((uid, _no_lessons_message(group or "—", day, week, title)))
+        # занятия группы могут быть в другом файле этого дня («Изменения») —
+        # «Занятий нет» пишем только тем, у кого пар нет ни в одном файле дня
+        merged = pipeline.merged_schedule_for(day, group or "—")
+        if merged and any(not les.is_free for les in merged.lessons):
+            extra.append((uid, format_schedule(merged, pipeline.bells,
+                                               heading="Новое расписание на")))
+        else:
+            extra.append((uid, _no_lessons_message(group or "—", day, week, title)))
     return messages + extra
 
 

@@ -55,6 +55,9 @@ def _build_messages(path, doc_title: str, state: State) -> list[tuple[str, str]]
     ]
     recipients += [(uid, group, False) for uid, group in state.users.items() if uid != owner_id]
 
+    # пары берём изо всех файлов дня (дневной + «Изменения»), а не только из этого файла
+    day = pipeline.file_date(path)
+
     rendered: dict[tuple[str, bool], str] = {}
     failed: dict[tuple[str, bool], Exception] = {}
 
@@ -63,8 +66,9 @@ def _build_messages(path, doc_title: str, state: State) -> list[tuple[str, str]]
         key = (group, with_homework)
         if key not in rendered and key not in failed:
             try:
-                schedule = pipeline.load_schedule_from_file(path, group)
-                if not schedule.lessons:
+                schedule = (pipeline.merged_schedule_for(day, group) if day is not None
+                            else pipeline.load_schedule_from_file(path, group))
+                if schedule is None or not schedule.lessons:
                     raise ValueError(f"в файле нет занятий для группы «{group}»")
                 if with_homework:
                     pipeline.enrich_with_homework(schedule)

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import io
 import logging
-from datetime import date
+from datetime import date, timedelta
+from pathlib import Path
 from typing import Iterable
 
 import docx
@@ -12,8 +13,8 @@ import docx
 from config import settings
 from services import eljur as eljur_mod
 from services.bells import Bells
-from services.formatter import format_schedule
-from services.models import DaySchedule
+from services.formatter import format_date, format_schedule
+from services.models import DaySchedule, Lesson
 from services.parser import collect_groups, extract_header_stamp, is_group_code, normalize_group, parse_docx
 from services.state import State
 from services.vk_source import VkError, VkSource
@@ -89,13 +90,24 @@ def _stamp_of(path: Path) -> tuple[date, int | None] | None:
         return None
 
 
-def _find_local_for_date(target: date) -> Path | None:
-    """Самый свежий локальный .docx с датой target в колонтитуле."""
+def file_date(path) -> date | None:
+    """Дата файла из колонтитула; None — колонтитул не разобран."""
+    stamp = _stamp_of(Path(path))
+    return stamp[0] if stamp else None
+
+
+def _files_for_date(target: date) -> list[Path]:
+    """Все локальные .docx с датой target в колонтитуле, от новых к старым.
+
+    На день может быть несколько файлов (дневное расписание + «Изменения» с сайта) —
+    для полной картины нужны все, иначе группы из второго файла «пропадают».
+    """
+    out: list[Path] = []
     for path in _local_files_newest_first():
         stamp = _stamp_of(path)
         if stamp and stamp[0] == target:
-            return path
-    return None
+            out.append(path)
+    return out
 
 
 def _find_local_latest() -> Path | None:
@@ -104,6 +116,70 @@ def _find_local_latest() -> Path | None:
         if _stamp_of(path):
             return path
     return None
+
+
+def merged_schedule_for(day: date, group: str) -> DaySchedule | None:
+    """Расписание группы на день из ВСЕХ файлов этого дня; None — файлов нет.
+
+    Дубли пар (дневной файл + «Изменения») схлопываются: свежий файл главнее.
+    """
+    files = _files_for_date(day)
+    if not files:
+        return None
+    key = normalize_group(group or settings.group)
+    merged: dict[tuple, Lesson] = {}
+    week: int | None = None
+    for path in reversed(files):  # старые первыми: новое перезаписывает
+        try:
+            groups = collect_groups(docx.Document(str(path)))
+        except Exception:
+            log.exception("Не удалось разобрать %r", path.name)
+            continue
+        if week is None:
+            stamp = _stamp_of(path)
+            if stamp:
+                week = stamp[1]
+        for les in groups.get(key, []):
+            slot = ((les.pair_start, les.pair_end) if les.pair_start is not None
+                    else ("label", les.pair_label))
+            merged[slot] = les
+    lessons = sorted(merged.values(),
+                     key=lambda l: (l.pair_start is not None, l.pair_start or 0, l.pair_end or 0))
+    return DaySchedule(date=day, group=key, week=week, lessons=lessons,
+                       source_filename=files[0].name)
+
+
+def _next_classes(target: date, group: str, lookahead: int = 8) -> tuple[date, DaySchedule] | None:
+    """Ближайший день после target с занятиями группы (по локальным файлам)."""
+    for shift in range(1, lookahead + 1):
+        day = date.fromordinal(target.toordinal() + shift)
+        sched = merged_schedule_for(day, group)
+        if sched and any(not les.is_free for les in sched.lessons):
+            return day, sched
+    return None
+
+
+def _render_rest_day(target: date, group: str, with_homework: bool) -> str:
+    """День без пар: «отдыхай» + расписание ближайшего дня с парами (на каждую неделю)."""
+    today = date.today()
+    if target == today:
+        when = "Сегодня"
+    elif target == today + timedelta(days=1):
+        when = "Завтра"
+    else:
+        when = f"На {target:%d.%m}"
+    found = _next_classes(target, group)
+    if found is None:
+        raise NoFileError(
+            f"{when} — {format_date(target)}: занятий нет, "
+            f"и расписание на ближайшие дни пока не выложили."
+        )
+    day, sched = found
+    if with_homework:
+        enrich_with_homework(sched)
+    head = f"{when} — {format_date(target)}: занятий нет, отдыхай 😊"
+    nxt = f"Пары будут {format_date(day)}:"
+    return f"{head}\n{nxt}\n\n" + format_schedule(sched, bells, heading="Расписание на")
 
 
 def note_groups(groups: Iterable[str]) -> None:
@@ -145,7 +221,7 @@ def list_groups() -> list[str]:
     groups: set[str] = set()
     for path in files:
         try:
-            groups |= set(collect_groups(docx.Document(str(path))))
+            groups |= {g for g in collect_groups(docx.Document(str(path))) if is_group_code(g)}
         except Exception:
             log.exception("Не удалось разобрать %r для списка групп", path.name)
     note_groups(groups)
@@ -177,21 +253,11 @@ def _load_schedule(path: Path, group: str | None, day: date) -> DaySchedule:
         ) from exc
 
 
-def render_for_date(target: date, group: str | None = None,
-                    with_homework: bool = False, heading: str = "Расписание на") -> str:
-    """Текст сообщения с расписанием на target — из файла с датой target в колонтитуле.
+def _fetch_vk_for_date(target: date) -> list[Path]:
+    """Файлы беседы VK с датой target -> сохранены в download_dir, от новых к старым.
 
-    Имя файла датой не является, а школа кидает расписание на следующий день
-    (в пятницу — сразу на субботу и на понедельник), поэтому файл ищется по дате
-    из колонтитула, а не по имени/новизне. Сначала локальные копии в download_dir
-    (работает и без VK), затем беседа VK.
+    NoFileError: в VK ничего на эту дату (или VK недоступен и локально пусто).
     """
-    path = _find_local_for_date(target)
-    if path is not None:
-        schedule = _load_schedule(path, group, target)
-        return _render(schedule, with_homework, heading)
-
-    # локально файла на эту дату нет — ищем в беседе VK
     try:
         vk = make_vk()
         infos = vk.list_docx(min_date=0)
@@ -202,9 +268,9 @@ def render_for_date(target: date, group: str | None = None,
         ) from exc
     if not infos:
         raise NoFileError("Пока нет ни одного файла расписания.")
-    match = None
+    saved: list[Path] = []
     seen: set[date] = set()
-    for info in reversed(infos):  # новые первыми: при двух файлах на день берём самый свежий
+    for info in reversed(infos):  # новые первыми
         stamp = _doc_stamps.get(info.message_id)
         if stamp is None:
             try:
@@ -215,33 +281,61 @@ def render_for_date(target: date, group: str | None = None,
             _doc_stamps[info.message_id] = stamp
         seen.add(stamp[0])
         if stamp[0] == target:
-            match = info
-            break
-    if match is None:
+            saved.append(vk.save(vk.fetch(info)))
+    if not saved:
         nearest = sorted(seen, key=lambda d: (abs((d - target).days), d))[:6]
         available = ", ".join(f"{d:%d.%m}" for d in sorted(nearest)) or "—"
         raise NoFileError(
             f"Расписание на {target:%d.%m} ещё не кидали. "
             f"Есть файлы на: {available}."
         )
-    path = vk.save(vk.fetch(match))
-    schedule = _load_schedule(path, group, target)
-    return _render(schedule, with_homework, heading)
+    return saved
+
+
+def render_for_date(target: date, group: str | None = None,
+                    with_homework: bool = False, heading: str = "Расписание на") -> str:
+    """Текст сообщения с расписанием на target — из всех файлов с датой target.
+
+    Имя файла датой не является, школа кидает расписание на следующий день
+    (в пятницу — сразу на субботу и на понедельник), поэтому файлы ищутся по дате
+    из колонтитула. На день бывает несколько файлов (дневной + «Изменения») —
+    пары сливаются. Если занятий нет (воскресенье, каникулы, группы не в файле) —
+    показываем ближайший день с парами и «отдыхай»: так на каждую неделю.
+    """
+    group = group or settings.group
+    files = _files_for_date(target)
+    if not files:
+        try:
+            files = _fetch_vk_for_date(target)
+        except NoFileError:
+            files = []
+    if files:
+        schedule = merged_schedule_for(target, group)
+        if schedule and any(not les.is_free for les in schedule.lessons):
+            return _render(schedule, with_homework, heading)
+    return _render_rest_day(target, group, with_homework)
 
 
 def render_latest(group: str | None = None,
                   with_homework: bool = False, heading: str = "Расписание на") -> str:
-    """Расписание из самого свежего файла — независимо от того, на какой он день."""
-    path = _find_local_latest()
-    if path is None:
-        try:
-            vk = make_vk()
-            doc = vk.find_latest_docx(min_date=0)
-        except VkError as exc:
-            raise NoFileError("Файл расписания ещё не загружен, и VK сейчас недоступен.") from exc
-        if doc is None:
-            raise NoFileError("Пока нет ни одного файла расписания.")
-        path = vk.save(doc)
-    stamp = _stamp_of(path)
-    schedule = _load_schedule(path, group, stamp[0] if stamp else date.today())
+    """Расписание на самый свежий день с файлами — независимо от даты."""
+    group = group or settings.group
+    latest = None
+    for path in _local_files_newest_first():
+        stamp = _stamp_of(path)
+        if stamp and (latest is None or stamp[0] > latest):
+            latest = stamp[0]
+    if latest is not None:
+        schedule = merged_schedule_for(latest, group)
+        if schedule is not None:
+            return _render(schedule, with_homework, heading)
+    try:
+        vk = make_vk()
+        doc = vk.find_latest_docx(min_date=0)
+    except VkError as exc:
+        raise NoFileError("Файл расписания ещё не загружен, и VK сейчас недоступен.") from exc
+    if doc is None:
+        raise NoFileError("Пока нет ни одного файла расписания.")
+    path = vk.save(doc)
+    schedule = _load_schedule(path, group, _stamp_of(path)[0] if _stamp_of(path) else date.today())
     return _render(schedule, with_homework, heading)
