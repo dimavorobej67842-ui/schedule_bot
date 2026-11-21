@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     # «Избранное» VK (спец-диалог 2000000001) и диалог с собой: файлы оттуда идут ТОЛЬКО владельцу
     vk_fav_peer_ids: str = "2000000001,526672312"
 
+    # Сайт КНТ (knt-oil.ru): «Изменения к основному расписанию» — запасной источник
+    web_check_interval: int = 300  # секунд между проверками сайта
+
     @property
     def fav_peer_ids(self) -> list[int]:
         return [int(x) for x in self.vk_fav_peer_ids.replace(";", ",").split(",") if x.strip()]

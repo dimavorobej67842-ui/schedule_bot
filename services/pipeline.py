@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 from datetime import date
 from typing import Iterable
@@ -13,15 +14,15 @@ from services import eljur as eljur_mod
 from services.bells import Bells
 from services.formatter import format_schedule
 from services.models import DaySchedule
-from services.parser import collect_groups, parse_docx
+from services.parser import collect_groups, extract_header_stamp, is_group_code, normalize_group, parse_docx
 from services.state import State
-from services.vk_source import VkSource
+from services.vk_source import VkError, VkSource
 
 log = logging.getLogger(__name__)
 
 bells = Bells(settings.bells_file)
 
-_groups_cache: tuple[int, list[str]] | None = None
+_groups_cache: tuple[object, list[str]] | None = None
 
 
 class NoFileError(RuntimeError):
@@ -34,6 +35,20 @@ def make_vk() -> VkSource:
 
 def load_schedule_from_file(path, group: str | None = None) -> DaySchedule:
     return parse_docx(path, group or settings.group)
+
+
+def looks_like_schedule(path) -> bool:
+    """True, если в файле есть группы с настоящими занятиями — это расписание.
+
+    Чужие файлы (ведомости, списки групп) дают либо ноль групп, либо только
+    строки «Нет урока» — такое расписанием не считаем. Группы настоящего
+    расписания запоминаются в state — чтобы меню переживало частичные файлы.
+    """
+    groups = collect_groups(docx.Document(str(path)))
+    is_schedule = any(not les.is_free for lessons in groups.values() for les in lessons)
+    if is_schedule:
+        note_groups(groups)
+    return is_schedule
 
 
 def enrich_with_homework(schedule: DaySchedule) -> None:
@@ -53,45 +68,91 @@ def enrich_with_homework(schedule: DaySchedule) -> None:
         lesson.homework = eljur_mod.match_homework(lesson.subject, hw_by_subject)
 
 
-def file_groups(path) -> list[str]:
-    """Список групп из одного файла расписания."""
-    return sorted(collect_groups(docx.Document(str(path))))
+def _local_files_newest_first() -> list[Path]:
+    """Все .docx, накопленные в download_dir (VK-файлы и конверсии с сайта)."""
+    if not settings.download_dir.exists():
+        return []
+
+    def mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(settings.download_dir.glob("*.docx"), key=mtime, reverse=True)
+
+
+def _stamp_of(path: Path) -> tuple[date, int | None] | None:
+    try:
+        return extract_header_stamp(docx.Document(str(path)))
+    except Exception:
+        return None
+
+
+def _find_local_for_date(target: date) -> Path | None:
+    """Самый свежий локальный .docx с датой target в колонтитуле."""
+    for path in _local_files_newest_first():
+        stamp = _stamp_of(path)
+        if stamp and stamp[0] == target:
+            return path
+    return None
+
+
+def _find_local_latest() -> Path | None:
+    """Самый свежий локальный .docx с читаемым колонтитулом."""
+    for path in _local_files_newest_first():
+        if _stamp_of(path):
+            return path
+    return None
 
 
 def note_groups(groups: Iterable[str]) -> None:
-    """Запомнить группы в state: меню переживает частичные/новые файлы."""
-    st = State.load(settings.state_file)
-    merged = sorted(set(st.known_groups) | set(groups))
-    if merged != st.known_groups:
-        st.known_groups = merged
-        st.save(settings.state_file)
+    """Запомнить группы в state: меню переживает частичные файлы («Изменения» и т.п.)."""
+    new = {normalize_group(g) for g in groups if g and is_group_code(g)}
+    if not new:
+        return
+    State.update(settings.state_file,
+                 lambda s: setattr(s, "known_groups", sorted(set(s.known_groups) | new)))
 
 
 def list_groups() -> list[str]:
-    """Все группы: union из последних файлов, накопленного списка и выбора пользователей."""
+    """Все группы: union свежих файлов + накопленный список + выбор пользователей.
+
+    Раньше брался один последний файл — и «Изменения к расписанию» с сайта
+    (частичный файл) сужал меню до пары групп. Теперь список только растёт.
+    """
     global _groups_cache
-    vk = make_vk()
-    docs = vk.find_recent_docx(limit=5)
-    if not docs:
+    files = [p for p in _local_files_newest_first()[:5] if _stamp_of(p)]
+    if not files:
         st = State.load(settings.state_file)
         known = sorted(set(st.known_groups) | set(st.users.values()))
         if known:
             return known
-        raise NoFileError("В беседе VK нет ни одного файла .docx")
-    newest_id = docs[0].message_id
-    if _groups_cache and _groups_cache[0] == newest_id:
+        try:
+            vk = make_vk()
+            doc = vk.find_latest_docx(min_date=0)
+        except VkError as exc:
+            raise NoFileError("Файл расписания ещё не загружен, и VK сейчас недоступен.") from exc
+        if doc is None:
+            raise NoFileError("Пока нет ни одного файла расписания.")
+        path = vk.save(doc)
+        files = [path] if _stamp_of(path) else []
+        if not files:
+            raise NoFileError("Пока нет ни одного файла расписания.")
+    key = tuple((str(p), p.stat().st_mtime_ns) for p in files)
+    if _groups_cache and _groups_cache[0] == key:
         return _groups_cache[1]
     groups: set[str] = set()
-    for doc in docs:
+    for path in files:
         try:
-            groups |= set(file_groups(vk.save(doc)))
+            groups |= set(collect_groups(docx.Document(str(path))))
         except Exception:
-            log.exception("Не удалось разобрать %r для списка групп", doc.title)
+            log.exception("Не удалось разобрать %r для списка групп", path.name)
     note_groups(groups)
     st = State.load(settings.state_file)
     groups |= set(st.known_groups) | set(st.users.values())
     result = sorted(groups)
-    _groups_cache = (newest_id, result)
+    _groups_cache = (key, result)
     return result
 
 
@@ -101,30 +162,86 @@ def _render(schedule: DaySchedule, with_homework: bool, heading: str) -> str:
     return format_schedule(schedule, bells, heading=heading)
 
 
+# штампы «дата + неделя» по message_id: файлы в беседе неизменны, перечитывать их смысла нет
+_doc_stamps: dict[int, tuple[date, int | None]] = {}
+
+
+def _load_schedule(path: Path, group: str | None, day: date) -> DaySchedule:
+    try:
+        return load_schedule_from_file(path, group)
+    except ValueError as exc:
+        # группы в файле нет — для студента это «занятий нет», а не сбой
+        raise NoFileError(
+            f"В расписании на {day:%d.%m} нет твоей группы "
+            f"«{group or settings.group}» — похоже, занятий нет."
+        ) from exc
+
+
 def render_for_date(target: date, group: str | None = None,
                     with_homework: bool = False, heading: str = "Расписание на") -> str:
-    """Текст сообщения с расписанием на target. Берёт самый свежий файл из беседы VK."""
-    vk = make_vk()
-    doc = vk.find_latest_docx(min_date=0)
-    if doc is None:
-        raise NoFileError("В беседе VK нет ни одного файла .docx")
-    path = vk.save(doc)
-    schedule = load_schedule_from_file(path, group)
-    if schedule.date != target:
+    """Текст сообщения с расписанием на target — из файла с датой target в колонтитуле.
+
+    Имя файла датой не является, а школа кидает расписание на следующий день
+    (в пятницу — сразу на субботу и на понедельник), поэтому файл ищется по дате
+    из колонтитула, а не по имени/новизне. Сначала локальные копии в download_dir
+    (работает и без VK), затем беседа VK.
+    """
+    path = _find_local_for_date(target)
+    if path is not None:
+        schedule = _load_schedule(path, group, target)
+        return _render(schedule, with_homework, heading)
+
+    # локально файла на эту дату нет — ищем в беседе VK
+    try:
+        vk = make_vk()
+        infos = vk.list_docx(min_date=0)
+    except VkError as exc:
         raise NoFileError(
-            f"Файл с расписанием есть, но он на {schedule.date:%d.%m}, а нужен {target:%d.%m}. "
-            "Похоже, файл на нужный день ещё не кидали."
+            f"Расписание на {target:%d.%m} ещё не загружено, и VK сейчас недоступен. "
+            f"Попробуй позже."
+        ) from exc
+    if not infos:
+        raise NoFileError("Пока нет ни одного файла расписания.")
+    match = None
+    seen: set[date] = set()
+    for info in reversed(infos):  # новые первыми: при двух файлах на день берём самый свежий
+        stamp = _doc_stamps.get(info.message_id)
+        if stamp is None:
+            try:
+                stamp = extract_header_stamp(docx.Document(io.BytesIO(vk.fetch(info).content)))
+            except Exception:
+                log.warning("VK: в файле %r нет даты в колонтитуле — пропускаем", info.title)
+                continue
+            _doc_stamps[info.message_id] = stamp
+        seen.add(stamp[0])
+        if stamp[0] == target:
+            match = info
+            break
+    if match is None:
+        nearest = sorted(seen, key=lambda d: (abs((d - target).days), d))[:6]
+        available = ", ".join(f"{d:%d.%m}" for d in sorted(nearest)) or "—"
+        raise NoFileError(
+            f"Расписание на {target:%d.%m} ещё не кидали. "
+            f"Есть файлы на: {available}."
         )
+    path = vk.save(vk.fetch(match))
+    schedule = _load_schedule(path, group, target)
     return _render(schedule, with_homework, heading)
 
 
 def render_latest(group: str | None = None,
                   with_homework: bool = False, heading: str = "Расписание на") -> str:
     """Расписание из самого свежего файла — независимо от того, на какой он день."""
-    vk = make_vk()
-    doc = vk.find_latest_docx(min_date=0)
-    if doc is None:
-        raise NoFileError("В беседе VK нет ни одного файла .docx")
-    path = vk.save(doc)
-    schedule = load_schedule_from_file(path, group)
+    path = _find_local_latest()
+    if path is None:
+        try:
+            vk = make_vk()
+            doc = vk.find_latest_docx(min_date=0)
+        except VkError as exc:
+            raise NoFileError("Файл расписания ещё не загружен, и VK сейчас недоступен.") from exc
+        if doc is None:
+            raise NoFileError("Пока нет ни одного файла расписания.")
+        path = vk.save(doc)
+    stamp = _stamp_of(path)
+    schedule = _load_schedule(path, group, stamp[0] if stamp else date.today())
     return _render(schedule, with_homework, heading)

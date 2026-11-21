@@ -1,4 +1,4 @@
-"""Сборка текста сообщения для Telegram (HTML)."""
+﻿"""Сборка текста сообщения для Telegram (HTML)."""
 
 from __future__ import annotations
 
@@ -45,8 +45,11 @@ def _lesson_line(lesson: Lesson, bells: DayBells) -> str:
 
 def format_schedule(schedule: DaySchedule, bells: Bells, heading: str = "Расписание на") -> str:
     day = bells.for_weekday(schedule.date.weekday())
+    title = format_date(schedule.date)
+    if schedule.week is not None:
+        title += f" · {schedule.week} неделя"
     lines = [
-        f"🗓 <b>{escape(heading)} {format_date(schedule.date)}</b>",
+        f"🗓 <b>{escape(heading)} {escape(title)}</b>",
         f"👥 {escape(schedule.group)}",
         "",
     ]

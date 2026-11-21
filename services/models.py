@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
@@ -26,5 +26,6 @@ class Lesson:
 class DaySchedule:
     date: date
     group: str
+    week: int | None = None
     lessons: list[Lesson] = field(default_factory=list)
     source_filename: str = ""

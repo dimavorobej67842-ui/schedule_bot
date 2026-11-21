@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import re
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 import docx
@@ -12,31 +13,25 @@ from docx.table import Table
 
 from .models import DaySchedule, Lesson
 
+log = logging.getLogger(__name__)
+
 NO_LESSON = {"нет урока", "нет", "—", "-", ""}
 
 _PAIR_RE = re.compile(r"(\d+)\s*[-–—]?\s*(\d+)?\s*п\.?", re.IGNORECASE)
 _PAIR_BARE_RE = re.compile(r"^(\d{1,2})\s*[-–—]\s*(\d{1,2})$|^(\d{1,2})$")
 _NO_LETTERS_RE = re.compile(r"[a-zа-яё]", re.IGNORECASE)
-# год — только 4-значный: иначе «23.11_10нед» превращался в 23.11.2010 (вторник вместо понедельника)
-_DATE_IN_NAME_RE = re.compile(r"(?<!\d)(\d{1,2})[.\-_ ](\d{1,2})(?:[.\-_ ](\d{4}))?(?!\d)")
-_DAY_IN_NAME_RE = re.compile(r"(?<!\d)(\d{1,2})(?!\d)")
-_WEEKDAY_TOKEN_RE = re.compile(
-    r"(?<![а-яёa-z])(?:понедельник|вторник|среда|четверг|пятница|суббота|воскресенье"
-    r"|пн|вт|ср|чт|пт|сб|вс)(?![а-яёa-z])",
-    re.IGNORECASE,
-)
-_WEEKDAY_TOKENS = {
-    "пн": 0, "понедельник": 0,
-    "вт": 1, "вторник": 1,
-    "ср": 2, "среда": 2,
-    "чт": 3, "четверг": 3,
-    "пт": 4, "пятница": 4,
-    "сб": 5, "суббота": 5,
-    "вс": 6, "воскресенье": 6,
+_DATE_IN_HEADER_RE = re.compile(r"(\d{1,2})\s*\.\s*(\d{1,2})\s*\.\s*(\d{4})")
+_WEEK_IN_HEADER_RE = re.compile(r"(\d+)\s*НЕДЕЛЯ", re.IGNORECASE)
+# колонтитул склеивается без разделителей («ЗАНЯТИЙПОНЕДЕЛЬНИК») — ищем словом без границ
+_WEEKDAY_IN_HEADER_RE = re.compile(
+    r"ПОНЕДЕЛЬНИК|ВТОРНИК|СРЕДА|ЧЕТВЕРГ|ПЯТНИЦА|СУББОТА|ВОСКРЕСЕНЬЕ", re.IGNORECASE)
+_WEEKDAY_WORDS = {
+    "ПОНЕДЕЛЬНИК": 0, "ВТОРНИК": 1, "СРЕДА": 2, "ЧЕТВЕРГ": 3,
+    "ПЯТНИЦА": 4, "СУББОТА": 5, "ВОСКРЕСЕНЬЕ": 6,
 }
 
-_GROUP_RE = re.compile(r"^\d{2,4}-[А-ЯЁ]{2,5}(?:-\d{1,2}Д?)?$", re.IGNORECASE)
-_GROUP_TOKEN_RE = re.compile(r"\d{2,4}-[А-ЯЁ]{2,5}(?:-\d{1,2}Д?)?(?=\s|$)", re.IGNORECASE)
+_GROUP_RE = re.compile(r"^\d{2,4}-[А-ЯЁ]{2,5}(?:-\d{1,3}Д?)?$", re.IGNORECASE)
+_GROUP_TOKEN_RE = re.compile(r"\d{2,4}-[А-ЯЁ]{2,5}(?:-\d{1,3}Д?)?(?=\s|$)", re.IGNORECASE)
 _PAIR_CELL_RE = re.compile(r"^\d{1,2}(?:\s*[-–—]\s*\d{1,2})?\s*п\.?$", re.IGNORECASE)
 _PAIR_NUM_RE = re.compile(r"^\d{1,2}(?:[-–—]\d{1,2})?$")
 _TEACHER_RE = re.compile(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.[А-ЯЁ]\.")
@@ -71,6 +66,11 @@ def normalize_group(name: str) -> str:
     return name
 
 
+def is_group_code(name: str) -> bool:
+    """True, если строка похожа на код группы («2025-ТНГ-96Д», «26-СВ»), а не на мусор."""
+    return bool(_GROUP_RE.match(_clean(name)))
+
+
 def parse_pair_label(label: str) -> tuple[int | None, int | None]:
     """'1 п.' -> (1, 1); '3-4 п.' -> (3, 4); '2' -> (2, 2); мусор -> (None, None)."""
     m = _PAIR_RE.search(label or "")
@@ -93,74 +93,48 @@ def parse_pair_label(label: str) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _weekday_from_stem(stem: str) -> int | None:
-    """0=пн..6=вс по токену дня недели в имени файла («расписание_Пн_...» -> 0)."""
-    m = _WEEKDAY_TOKEN_RE.search(stem)
-    return _WEEKDAY_TOKENS[m.group(0).lower()] if m else None
+def extract_header_stamp(doc) -> tuple[date, int | None]:
+    """Дата и номер недели из колонтитула документа.
 
+    В колонтитуле школа пишет «РАСПИСАНИЕ ЗАНЯТИЙ / ПОНЕДЕЛЬНИК 09.11.2026 г. / 1 НЕДЕЛЯ».
+    Имя файла датой не является («_09.docx» — просто имя), единственный источник —
+    колонтитул: день недели + число ЧЧ.ММ.ГГГГ + номер недели.
 
-def _pick_date(candidates: list[date], target: date, weekday: int | None) -> date | None:
-    """Ближайший к target; если в имени был день недели — сначала только совпадающие с ним."""
-    if weekday is not None:
-        matching = [d for d in candidates if d.weekday() == weekday]
-        if matching:
-            candidates = matching
-    return min(candidates, key=lambda d: abs((d - target).days)) if candidates else None
-
-
-def extract_date_from_filename(filename: str, reference: date | None = None) -> date:
-    """Дата из имени файла (напр. '09.docx' = день 9). Фолбэк — завтра.
-
-    'дд.мм[.гггг]' — точная дата (год только 4-значный, чтобы «10нед» не стало годом).
-    Иначе последнее число в имени = день; месяц/год — ближайшие к завтрашнему дню.
-    Токен дня недели (Пн/Вт/Ср/Чт/Пт/Сб/Вс) в имени уточняет кандидатов.
+    Число в колонтитуле иногда опечатано («ПОНЕДЕЛЬНИК 24.11.2026» при понедельнике
+    23.11) — если слово дня недели спорит с датой, берём ближайший день (±3),
+    подходящий под слово: слово в шаблоне верное, а число набирают руками.
     """
-    reference = reference or date.today()
-    target = reference + timedelta(days=1)
-    stem = Path(filename).stem
-    weekday = _weekday_from_stem(stem)
-
-    m = _DATE_IN_NAME_RE.search(stem)
-    if m:
-        day, month = int(m.group(1)), int(m.group(2))
-        candidates = []
-        if m.group(3):
-            try:
-                candidates.append(date(int(m.group(3)), month, day))
-            except ValueError:
-                pass
-        else:
-            for y in (reference.year - 1, reference.year, reference.year + 1):
-                try:
-                    candidates.append(date(y, month, day))
-                except ValueError:
-                    continue
-        picked = _pick_date(candidates, target, weekday)
-        if picked:
-            return picked
-
-    days = _DAY_IN_NAME_RE.findall(stem)
-    if days:
-        # последнее число в имени = день («расписание_Чт_10нед_05.docx» -> 5)
-        day = int(days[-1])
-        if 1 <= day <= 31:
-            candidates = []
-            for month_shift in (-1, 0, 1):
-                y, mo = reference.year, reference.month + month_shift
-                if mo > 12:
-                    y, mo = y + 1, mo - 12
-                elif mo < 1:
-                    y, mo = y - 1, mo + 12
-                try:
-                    candidates.append(date(y, mo, day))
-                except ValueError:
-                    continue
-            picked = _pick_date(candidates, target, weekday)
-            if picked:
-                return picked
-
-    return target
-
+    texts: list[str] = []
+    for rel in doc.part.rels.values():
+        if not rel.reltype.endswith("/header"):
+            continue
+        for node in rel.target_part.element.iter():
+            if node.tag.endswith("}t") and node.text:
+                texts.append(node.text)
+    # текст колонтитула разбит на куски («12» «.» «10» «.2026 г.») — склеиваем без разделителей
+    stamp = "".join(texts)
+    wm = _WEEK_IN_HEADER_RE.search(stamp)
+    week = int(wm.group(1)) if wm else None
+    wd_word = _WEEKDAY_IN_HEADER_RE.search(stamp)
+    weekday = _WEEKDAY_WORDS[wd_word.group(0).upper()] if wd_word else None
+    for m in _DATE_IN_HEADER_RE.finditer(stamp):
+        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            stamp_date = date(year, month, day)
+        except ValueError:
+            continue
+        if weekday is not None and stamp_date.weekday() != weekday:
+            shift = (weekday - stamp_date.weekday()) % 7
+            if shift > 3:
+                shift -= 7
+            fixed = date.fromordinal(stamp_date.toordinal() + shift)
+            log.warning(
+                "Колонтитул: «%s %s» — дата не совпадает с днём недели, берём %s",
+                wd_word.group(0).upper(), stamp_date, fixed,
+            )
+            stamp_date = fixed
+        return stamp_date, week
+    raise ValueError("в файле нет колонтитула «РАСПИСАНИЕ ЗАНЯТИЙ … ЧЧ.ММ.ГГГГ»")
 
 # ---------- схема колонок ----------
 
@@ -280,6 +254,13 @@ def _apply_fields(f: dict[str, str], groups: dict[str, list[Lesson]], current: s
 
     start, end = parse_pair_label(col_pair)
     if start is None:
+        # «Уч.практика» на весь день — строка без номера пары
+        if "практик" in subject_l or "практик" in pair_l:
+            groups[current].append(
+                Lesson(pair_label=col_pair or col_subject,
+                       subject=col_subject or col_pair, teacher=teacher, room=room)
+            )
+            return current
         # строка без распознанной пары — мусор (сдвинутые колонки и т.п.)
         return current
 
@@ -398,7 +379,7 @@ def collect_groups(doc: docx.Document) -> dict[str, list[Lesson]]:
     return groups
 
 
-def parse_docx(path: str | Path, group: str, reference: date | None = None) -> DaySchedule:
+def parse_docx(path: str | Path, group: str) -> DaySchedule:
     """Достаёт расписание одной группы из файла. Бросает ValueError, если группу не нашли."""
     path = Path(path)
     doc = docx.Document(str(path))
@@ -408,8 +389,10 @@ def parse_docx(path: str | Path, group: str, reference: date | None = None) -> D
     if lessons is None:
         known = ", ".join(sorted(groups)) or "нет групп в файле"
         raise ValueError(f"Группа «{group}» не найдена в файле {path.name}. Группы в файле: {known}")
+    day, week = extract_header_stamp(doc)
     return DaySchedule(
-        date=extract_date_from_filename(path.name, reference=reference),
+        date=day,
+        week=week,
         group=key,
         lessons=lessons,
         source_filename=path.name,
