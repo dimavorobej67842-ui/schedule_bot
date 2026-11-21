@@ -67,6 +67,10 @@ def _check_once(state: State) -> list[tuple[str, str]]:
     except Exception:
         log.exception("Не удалось сохранить файл %r", doc.title)
         return [(str(settings.chat_id), f"⚠️ Новый файл {escape(doc.title)}, но сохранить его не удалось.")]
+    try:
+        pipeline.note_groups(pipeline.file_groups(path))
+    except Exception:
+        log.exception("Не удалось извлечь группы из %r", doc.title)
     return _build_messages(path, doc.title, state)
 
 

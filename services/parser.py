@@ -17,8 +17,23 @@ NO_LESSON = {"нет урока", "нет", "—", "-", ""}
 _PAIR_RE = re.compile(r"(\d+)\s*[-–—]?\s*(\d+)?\s*п\.?", re.IGNORECASE)
 _PAIR_BARE_RE = re.compile(r"^(\d{1,2})\s*[-–—]\s*(\d{1,2})$|^(\d{1,2})$")
 _NO_LETTERS_RE = re.compile(r"[a-zа-яё]", re.IGNORECASE)
-_DATE_IN_NAME_RE = re.compile(r"(\d{1,2})[.\-_ ](\d{1,2})(?:[.\-_ ](\d{2,4}))?")
+# год — только 4-значный: иначе «23.11_10нед» превращался в 23.11.2010 (вторник вместо понедельника)
+_DATE_IN_NAME_RE = re.compile(r"(?<!\d)(\d{1,2})[.\-_ ](\d{1,2})(?:[.\-_ ](\d{4}))?(?!\d)")
 _DAY_IN_NAME_RE = re.compile(r"(?<!\d)(\d{1,2})(?!\d)")
+_WEEKDAY_TOKEN_RE = re.compile(
+    r"(?<![а-яёa-z])(?:понедельник|вторник|среда|четверг|пятница|суббота|воскресенье"
+    r"|пн|вт|ср|чт|пт|сб|вс)(?![а-яёa-z])",
+    re.IGNORECASE,
+)
+_WEEKDAY_TOKENS = {
+    "пн": 0, "понедельник": 0,
+    "вт": 1, "вторник": 1,
+    "ср": 2, "среда": 2,
+    "чт": 3, "четверг": 3,
+    "пт": 4, "пятница": 4,
+    "сб": 5, "суббота": 5,
+    "вс": 6, "воскресенье": 6,
+}
 
 _GROUP_RE = re.compile(r"^\d{2,4}-[А-ЯЁ]{2,5}(?:-\d{1,2}Д?)?$", re.IGNORECASE)
 _GROUP_TOKEN_RE = re.compile(r"\d{2,4}-[А-ЯЁ]{2,5}(?:-\d{1,2}Д?)?(?=\s|$)", re.IGNORECASE)
@@ -78,38 +93,51 @@ def parse_pair_label(label: str) -> tuple[int | None, int | None]:
     return None, None
 
 
+def _weekday_from_stem(stem: str) -> int | None:
+    """0=пн..6=вс по токену дня недели в имени файла («расписание_Пн_...» -> 0)."""
+    m = _WEEKDAY_TOKEN_RE.search(stem)
+    return _WEEKDAY_TOKENS[m.group(0).lower()] if m else None
+
+
+def _pick_date(candidates: list[date], target: date, weekday: int | None) -> date | None:
+    """Ближайший к target; если в имени был день недели — сначала только совпадающие с ним."""
+    if weekday is not None:
+        matching = [d for d in candidates if d.weekday() == weekday]
+        if matching:
+            candidates = matching
+    return min(candidates, key=lambda d: abs((d - target).days)) if candidates else None
+
+
 def extract_date_from_filename(filename: str, reference: date | None = None) -> date:
     """Дата из имени файла (напр. '09.docx' = день 9). Фолбэк — завтра.
 
-    Из нескольких кандидатов (этот/следующий/предыдущий месяц) берётся ближайшая к завтрашнему дню.
+    'дд.мм[.гггг]' — точная дата (год только 4-значный, чтобы «10нед» не стало годом).
+    Иначе последнее число в имени = день; месяц/год — ближайшие к завтрашнему дню.
+    Токен дня недели (Пн/Вт/Ср/Чт/Пт/Сб/Вс) в имени уточняет кандидатов.
     """
     reference = reference or date.today()
     target = reference + timedelta(days=1)
     stem = Path(filename).stem
+    weekday = _weekday_from_stem(stem)
 
     m = _DATE_IN_NAME_RE.search(stem)
     if m:
         day, month = int(m.group(1)), int(m.group(2))
+        candidates = []
         if m.group(3):
-            year = int(m.group(3))
-            year += 2000 if year < 100 else 0
             try:
-                return date(year, month, day)
+                candidates.append(date(int(m.group(3)), month, day))
             except ValueError:
                 pass
-        candidates = []
-        for month_shift in (-1, 0, 1):
-            y, mo = reference.year, reference.month + month_shift
-            if mo > 12:
-                y, mo = y + 1, mo - 12
-            elif mo < 1:
-                y, mo = y - 1, mo + 12
-            try:
-                candidates.append(date(y, mo, day))
-            except ValueError:
-                continue
-        if candidates:
-            return min(candidates, key=lambda d: abs((d - target).days))
+        else:
+            for y in (reference.year - 1, reference.year, reference.year + 1):
+                try:
+                    candidates.append(date(y, month, day))
+                except ValueError:
+                    continue
+        picked = _pick_date(candidates, target, weekday)
+        if picked:
+            return picked
 
     days = _DAY_IN_NAME_RE.findall(stem)
     if days:
@@ -127,8 +155,9 @@ def extract_date_from_filename(filename: str, reference: date | None = None) -> 
                     candidates.append(date(y, mo, day))
                 except ValueError:
                     continue
-            if candidates:
-                return min(candidates, key=lambda d: abs((d - target).days))
+            picked = _pick_date(candidates, target, weekday)
+            if picked:
+                return picked
 
     return target
 

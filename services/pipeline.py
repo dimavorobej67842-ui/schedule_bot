@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
+from typing import Iterable
 
 import docx
 
@@ -13,6 +14,7 @@ from services.bells import Bells
 from services.formatter import format_schedule
 from services.models import DaySchedule
 from services.parser import collect_groups, parse_docx
+from services.state import State
 from services.vk_source import VkSource
 
 log = logging.getLogger(__name__)
@@ -51,19 +53,46 @@ def enrich_with_homework(schedule: DaySchedule) -> None:
         lesson.homework = eljur_mod.match_homework(lesson.subject, hw_by_subject)
 
 
+def file_groups(path) -> list[str]:
+    """Список групп из одного файла расписания."""
+    return sorted(collect_groups(docx.Document(str(path))))
+
+
+def note_groups(groups: Iterable[str]) -> None:
+    """Запомнить группы в state: меню переживает частичные/новые файлы."""
+    st = State.load(settings.state_file)
+    merged = sorted(set(st.known_groups) | set(groups))
+    if merged != st.known_groups:
+        st.known_groups = merged
+        st.save(settings.state_file)
+
+
 def list_groups() -> list[str]:
-    """Все группы из самого свежего файла расписания."""
+    """Все группы: union из последних файлов, накопленного списка и выбора пользователей."""
     global _groups_cache
     vk = make_vk()
-    doc = vk.find_latest_docx(min_date=0)
-    if doc is None:
+    docs = vk.find_recent_docx(limit=5)
+    if not docs:
+        st = State.load(settings.state_file)
+        known = sorted(set(st.known_groups) | set(st.users.values()))
+        if known:
+            return known
         raise NoFileError("В беседе VK нет ни одного файла .docx")
-    if _groups_cache and _groups_cache[0] == doc.message_id:
+    newest_id = docs[0].message_id
+    if _groups_cache and _groups_cache[0] == newest_id:
         return _groups_cache[1]
-    path = vk.save(doc)
-    groups = sorted(collect_groups(docx.Document(str(path))))
-    _groups_cache = (doc.message_id, groups)
-    return groups
+    groups: set[str] = set()
+    for doc in docs:
+        try:
+            groups |= set(file_groups(vk.save(doc)))
+        except Exception:
+            log.exception("Не удалось разобрать %r для списка групп", doc.title)
+    note_groups(groups)
+    st = State.load(settings.state_file)
+    groups |= set(st.known_groups) | set(st.users.values())
+    result = sorted(groups)
+    _groups_cache = (newest_id, result)
+    return result
 
 
 def _render(schedule: DaySchedule, with_homework: bool, heading: str) -> str:
